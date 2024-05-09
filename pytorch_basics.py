@@ -483,6 +483,67 @@ learning_rate = 2e-2
 model = RNNTorch(input_dim, hidden_state_dim, layer_dim, output_dim)
 train_model(model, learning_rate, input_size)
 
+"""### LSTM with PyTorch
+
+- Use basic PyTorch components to build LSTM
+"""
+
+class LSTM(nn.Module):
+    def __init__(self, input_dim, hidden_state_dim, cell_state_dim, output_dim):
+        super().__init__()
+        self. hidden_state_dim = hidden_state_dim
+        self.cell_state_dim = cell_state_dim
+
+        self.forget_gate_net = nn.Sequential(
+            nn.Linear(input_dim + hidden_state_dim, cell_state_dim),
+            nn.Sigmoid(),
+        )
+        self.in_gate_net1 = nn.Sequential(
+            nn.Linear(input_dim + hidden_state_dim, cell_state_dim),
+            nn.Tanh(),
+        )
+        self.in_gate_net2 = nn.Sequential(
+            nn.Linear(input_dim + hidden_state_dim, cell_state_dim),
+            nn.Sigmoid(),
+        )
+        self.out_gate_net = nn.Sequential(
+            nn.Linear(input_dim + hidden_state_dim, hidden_state_dim),
+            nn.Sigmoid(),
+        )
+        self.out_net = nn.Sequential(
+            nn.Linear(hidden_state_dim, output_dim),
+        )
+
+    def forward(self, x):
+        batch_dim, seq_len, _ = x.size()
+        x = x.transpose(0,1)
+        self.hidden_state = torch.zeros(batch_dim, self.hidden_state_dim).to(device)
+        self.cell_state = torch.zeros(batch_dim, self.cell_state_dim).to(device)
+        for s in range(seq_len):
+            combined_in = torch.cat((x[s], self.hidden_state), 1)
+
+            forget_gate = torch.mul(self.cell_state, self.forget_gate_net(combined_in))
+            input_gate = torch.mul(self.in_gate_net1(combined_in), self.in_gate_net2(combined_in))
+            self.cell_state = torch.add(forget_gate, input_gate)
+
+            output_gate = self.out_gate_net(combined_in)
+            self.hidden_state = torch.mul(output_gate, torch.tanh(self.cell_state))
+
+        out = self.out_net(self.hidden_state)
+        return out
+
+input_dim = 28
+seq_dim = 28
+input_size = (-1, seq_dim, input_dim)
+hidden_dim = 20
+hidden_state_dim = 100
+cell_state_dim = 100
+output_dim = 10
+learning_rate = 2e-2
+
+model = LSTM(input_dim, hidden_state_dim, cell_state_dim, output_dim)
+train_model(model, learning_rate, input_size)
+
 """### PyTorch Built-in LSTM
 
 - Use the existing PyTorch LSTM component with 1 layer
