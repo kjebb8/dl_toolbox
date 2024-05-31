@@ -14,6 +14,7 @@ Original file is located at
 
 - From: https://pytorch.org/tutorials/beginner/hyperparameter_tuning_tutorial.html
 - Ray Tune Docs: https://docs.ray.io/en/latest/tune/index.html
+- Note: Tutorial is based on an original CNN tutorial. The comments marked by "HPT" show the new changes/additions with the hyperparameter tuning tutorial
 
 Ray Tune is an open source library for hyperparameter tuning. It contains the latest search algorithms, integrates with TensorBoard and other analysis libraries, and supports distributed training.
 
@@ -329,3 +330,303 @@ with best_checkpoint.as_directory() as checkpoint_dir:
 # %rm -r /tmp/ray/*
 # %rm -r /root/ray_results/*
 
+"""## Performance Profiling
+
+### PyTorch Profiler
+
+- PyTorch recipe: https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html
+
+- Profiler supports multithreaded models
+- Profiler runs in the same thread as the operation but it will also profile child operators that might run in another thread
+- Concurrently-running profilers will be scoped to their own thread to prevent mixing of results
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pip install torch torchvision
+
+import torch
+import torchvision.models as models
+from torch.profiler import profile, record_function, ProfilerActivity
+
+model = models.resnet18()
+inputs = torch.randn(5,3,224,224)
+
+"""---
+#### Profile CPU Execution Time
+---
+"""
+
+with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+    with record_function("model_inference"):
+        model(inputs)
+
+print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+
+print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10)) # "Self" Excludes time in child operations
+
+print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10)) # Finer granularity
+
+"""
+---
+#### Profile GPU Execution Time
+---
+"""
+
+model = models.resnet18().cuda()
+inputs = torch.randn(5,3,224,224).cuda()
+with profile(activities=[
+    ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+    with record_function("model_inference"):
+        model(inputs)
+
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+
+"""
+---
+#### Profile Memory
+---"""
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
+    with record_function("model_inference"):
+        model(inputs)
+
+print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
+
+print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
+
+"""
+---
+#### Tracing
+---"""
+
+model = models.resnet18().cuda()
+inputs = torch.randn(5, 3, 224, 224).cuda()
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    model(inputs)
+
+prof.export_chrome_trace("trace.json")
+
+# Open trace file in Chrome window at chrome://tracing
+
+"""
+---
+#### Stack Traces
+---"""
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    with_stack=True,
+) as prof:
+    with record_function("model_inference"):
+        model(inputs)
+
+print(prof.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_time_total", row_limit=2))
+# Not working, may be a PyTorch issue
+
+"""---
+#### Long-running Jobs
+---
+
+- Jobs like training can take a long time and have different requirements
+- Tracing all of a long job can be very slow and output large trace files
+
+schedule - specifies a function that takes an integer argument (step number) as an input and returns an action for the profiler, the best way to use this parameter is to use torch.profiler.schedule helper function that can generate a schedule for you;
+
+on_trace_ready - specifies a function that takes a reference to the profiler as an input and is called by the profiler each time the new trace is ready.
+"""
+
+from torch.profiler import schedule
+
+my_schedule = schedule(
+    skip_first=10, # ignore first 10 steps
+    wait=5,        # Idle time before collection
+    warmup=1,      # Initial discarded traces due to extra overhead
+    active=3,      # Number of steps to record data
+    repeat=2)      # Upper bound on the number of cycles (wait,warmup,active) to collect
+
+def trace_handler(p):
+    output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
+    print(output)
+    p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=torch.profiler.schedule(
+        wait=1,
+        warmup=1,
+        active=2),
+    on_trace_ready=trace_handler
+) as p:
+    for idx in range(8):
+        model(inputs)
+        p.step()
+
+"""### Profile Modules
+
+- PyTorch tutorial: https://pytorch.org/tutorials/beginner/profiler.html
+"""
+
+import torch
+import numpy as np
+from torch import nn
+import torch.autograd.profiler as profiler
+
+class MyModule(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(MyModule, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias)
+
+    def forward(self, input, mask):
+        with profiler.record_function("Linear"):
+            out = self.linear(input)
+
+        with profiler.record_function("Mask"):
+            threshold = out.sum(axis=1).mean().item()
+            hi_idx = np.argwhere(mask.cpu().numpy() > threshold) # Copy to CPU
+            hi_idx = torch.from_numpy(hi_idx).cuda() # Copy to CUDA
+
+        return out, hi_idx
+
+model = MyModule(500, 10).cuda()
+input = torch.rand(128,500).cuda()
+mask = torch.rand((500, 500, 500), dtype=torch.double).cuda()
+
+# warm up cuda
+model(input, mask)
+
+with profiler.profile(with_stack=True, profile_memory=True) as prof:
+    out, idx = model(input, mask)
+
+print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
+
+# Improve the memory performace of Mask by casting as float instead of double
+mask = torch.rand((500, 500, 500), dtype=torch.float).cuda()
+
+# warm up cuda
+model(input, mask)
+
+with profiler.profile(with_stack=True, profile_memory=True) as prof:
+    out, idx = model(input, mask)
+
+print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
+
+# Improve the time performance by eliminating copies
+class MyModule(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super(MyModule, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias)
+
+    def forward(self, input, mask):
+        with profiler.record_function("Linear"):
+            out = self.linear(input)
+
+        with profiler.record_function("Mask"):
+            threshold = out.sum(axis=1).mean()
+            hi_idx = (mask > threshold).nonzero(as_tuple=True)
+
+        return out, hi_idx
+
+
+model = MyModule(500, 10).cuda()
+input = torch.rand(128, 500).cuda()
+mask = torch.rand((500, 500, 500), dtype=torch.float).cuda()
+
+# warm-up
+model(input, mask)
+
+with profiler.profile(with_stack=True, profile_memory=True) as prof:
+    out, idx = model(input, mask)
+
+print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
+
+"""### Tensorboard
+
+- PyTorch tutorial: https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
+
+Also check Holistic Trace Analysis: https://hta.readthedocs.io/en/latest/index.html
+
+- PyTorch tutorial: https://pytorch.org/tutorials/beginner/hta_intro_tutorial.html
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pip install HolisticTraceAnalysis
+# %pip install torch_tb_profiler
+
+import torch
+import torch.nn
+import torch.optim
+import torch.profiler
+import torch.utils.data
+import torchvision.datasets
+import torchvision.models
+import torchvision.transforms as T
+
+transform = T.Compose(
+    [T.Resize(224),
+     T.ToTensor(),
+     T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+train_set = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+train_loader = torch.utils.data.DataLoader(train_set, batch_size=32, shuffle=True)
+
+# device = torch.device("cuda:0")
+device = torch.device('cpu')
+model = torchvision.models.resnet18(weights='IMAGENET1K_V1').to(device)
+criterion = torch.nn.CrossEntropyLoss().to(device)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+model.train()
+print("Resnet model")
+
+def train(data):
+    inputs, labels = data[0].to(device=device), data[1].to(device=device)
+    outputs = model(inputs)
+    loss = criterion(outputs, labels)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+with torch.profiler.profile(
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler(dir_name='./log/resnet18', use_gzip=False), # Generates and saves tensorboard files
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True
+) as prof:
+    for step, batch_data in enumerate(train_loader):
+        train(batch_data)
+        prof.step()  # Need to call this at each step to notify profiler of steps' boundary.
+        if step >= 1 + (1 + 3) * 2:
+            break
+
+# Tensorboard
+# tensorboard --logdir=./log
+# http://localhost:6006/#pytorch_profiler
+
+# HTA
+from hta.trace_analysis import TraceAnalysis
+trace_dir = "/content/log/resnet18/"
+trace_files = {0 : '8c230de2449a_145.1717189838062872263.pt.trace.json'}
+analyzer = TraceAnalysis(trace_dir=trace_dir, trace_files=trace_files)
+
+# Try HTA when GPU available
+# temporal_breakdown_df = analyzer.get_temporal_breakdown()
+
+"""## Benchmark
+
+- PyTorch tutorial: https://pytorch.org/tutorials/recipes/recipes/benchmark.html
+"""
+
+
+
+"""## Parameterizations
+
+- PyTorch tutorial: https://pytorch.org/tutorials/intermediate/parametrizations.html
+"""
+
+
+
+"""## Pruning
+
+- PyTorch tutorial: https://pytorch.org/tutorials/intermediate/pruning_tutorial.html
+"""
