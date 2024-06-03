@@ -332,6 +332,10 @@ with best_checkpoint.as_directory() as checkpoint_dir:
 
 """## Performance Profiling
 
+- CPU and GPU time and memory
+- Profiling of NN modules and training/inference runs
+- Visualization with TensorBoard/HTA
+
 ### PyTorch Profiler
 
 - PyTorch recipe: https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html
@@ -612,21 +616,671 @@ analyzer = TraceAnalysis(trace_dir=trace_dir, trace_files=trace_files)
 # Try HTA when GPU available
 # temporal_breakdown_df = analyzer.get_temporal_breakdown()
 
-"""## Benchmark
+"""## Benchmarking
+
+- Time execution of functions over many runs
+- Vary the inputs and number of threads used
+- Compare different algorithms or environments
+
 
 - PyTorch tutorial: https://pytorch.org/tutorials/recipes/recipes/benchmark.html
 """
 
+import torch
 
+
+def batched_dot_mul_sum(a, b):
+    '''Computes batched dot by multiplying and summing'''
+    return a.mul(b).sum(-1)
+
+
+def batched_dot_bmm(a, b):
+    '''Computes batched dot by reducing to ``bmm``'''
+    a = a.reshape(-1, 1, a.shape[-1])
+    b = b.reshape(-1, b.shape[-1], 1)
+    return torch.bmm(a, b).flatten(-3)
+
+
+# Input for benchmarking
+x = torch.randn(10000, 64)
+
+# Ensure that both functions compute the same output
+assert batched_dot_mul_sum(x, x).allclose(batched_dot_bmm(x, x))
+
+# Python timeit module
+
+import timeit
+
+t0 = timeit.Timer(
+    stmt='batched_dot_mul_sum(x, x)',
+    setup='from __main__ import batched_dot_mul_sum',
+    globals={'x': x})
+
+t1 = timeit.Timer(
+    stmt='batched_dot_bmm(x, x)',
+    setup='from __main__ import batched_dot_bmm',
+    globals={'x': x})
+
+print(f'mul_sum(x, x):  {t0.timeit(100) / 100 * 1e6:>5.1f} us')
+print(f'bmm(x, x):      {t1.timeit(100) / 100 * 1e6:>5.1f} us')
+
+'''
+PyTorch benchmark
+
+- Performs synchronization with CUDA
+- Accounts for warm-up time
+- Runs a single thread by default
+- Reports the time per run instead of the total runtime
+'''
+import torch.utils.benchmark as benchmark
+
+t0 = benchmark.Timer(
+    stmt='batched_dot_mul_sum(x, x)',
+    setup='from __main__ import batched_dot_mul_sum',
+    globals={'x': x})
+
+t1 = benchmark.Timer(
+    stmt='batched_dot_bmm(x, x)',
+    setup='from __main__ import batched_dot_bmm',
+    globals={'x': x})
+
+print(t0.timeit(100))
+print(t1.timeit(100))
+
+# x = torch.randn(10000, 1024, device='cuda')
+
+num_threads = torch.get_num_threads()
+print(f'Benchmarking on {num_threads} threads')
+
+t0 = benchmark.Timer(
+    stmt='batched_dot_mul_sum(x, x)',
+    setup='from __main__ import batched_dot_mul_sum',
+    globals={'x': x},
+    num_threads=num_threads,
+    label='Multithreaded batch dot',
+    sub_label='Implemented using mul and sum')
+
+t1 = benchmark.Timer(
+    stmt='batched_dot_bmm(x, x)',
+    setup='from __main__ import batched_dot_bmm',
+    globals={'x': x},
+    num_threads=num_threads,
+    label='Multithreaded batch dot',
+    sub_label='Implemented using bmm')
+
+print(t0.timeit(100))
+print(t1.timeit(100))
+
+# Autorange - Compute statistics for a period of time (min 200 ms)
+
+m0 = t0.blocked_autorange()
+m1 = t1.blocked_autorange()
+
+print(m0)
+print(m1)
+
+print(f"Mean:   {m0.mean * 1e6:6.2f} us")
+print(f"Median: {m0.median * 1e6:6.2f} us")
+
+# Compare benchmark results - vary inputs, # of threads
+from itertools import product
+
+# Compare takes a list of measurements which we'll save in results.
+results = []
+
+sizes = [1, 64, 1024]
+for b, n in product(sizes, sizes):
+    # label and sub_label are the rows
+    # description is the column
+    label = 'Batched dot'
+    sub_label = f'[{b}, {n}]'
+    x = torch.ones((b, n))
+    for num_threads in [1, 4, 16]:
+        results.append(benchmark.Timer(
+            stmt='batched_dot_mul_sum(x, x)',
+            setup='from __main__ import batched_dot_mul_sum',
+            globals={'x': x},
+            num_threads=num_threads,
+            label=label,
+            sub_label=sub_label,
+            description='mul/sum',
+        ).blocked_autorange(min_run_time=1))
+        results.append(benchmark.Timer(
+            stmt='batched_dot_bmm(x, x)',
+            setup='from __main__ import batched_dot_bmm',
+            globals={'x': x},
+            num_threads=num_threads,
+            label=label,
+            sub_label=sub_label,
+            description='bmm',
+        ).blocked_autorange(min_run_time=1))
+
+compare = benchmark.Compare(results)
+compare.trim_significant_figures()
+compare.colorize()
+compare.print()
+
+# Saving and loading with pickle
+# Can do A/B test with results from different Python envs
+import pickle
+
+ab_test_results = []
+for env in ('environment A: mul/sum', 'environment B: bmm'):
+    for b, n in ((1, 1), (1024, 10000), (10000, 1)):
+        x = torch.ones((b, n))
+        dot_fn = (batched_dot_mul_sum if env == 'environment A: mul/sum' else batched_dot_bmm)
+        m = benchmark.Timer(
+            stmt='batched_dot(x, x)',
+            globals={'x': x, 'batched_dot': dot_fn},
+            num_threads=1,
+            label='Batched dot',
+            description=f'[{b}, {n}]',
+            env=env,
+        ).blocked_autorange(min_run_time=1)
+        ab_test_results.append(pickle.dumps(m))
+
+ab_results = [pickle.loads(i) for i in ab_test_results]
+compare = benchmark.Compare(ab_results)
+compare.trim_significant_figures()
+compare.colorize()
+compare.print()
+
+# Demonstrate pickle round-trip
+round_tripped_results = pickle.loads(pickle.dumps(results))
+assert(str(benchmark.Compare(results)) == str(benchmark.Compare(round_tripped_results)))
+
+# Inputs with fuzzed parameters - gives more variety for input tensors
+from torch.utils.benchmark import Fuzzer, FuzzedParameter, FuzzedTensor, ParameterAlias
+
+# Generates random tensors with 128 to 10000000 elements and sizes k0 and k1 chosen from a
+# ``loguniform`` distribution in [1, 10000], 40% of which will be discontiguous on average.
+example_fuzzer = Fuzzer(
+    parameters = [
+        FuzzedParameter('k0', minval=1, maxval=10000, distribution='loguniform'),
+        FuzzedParameter('k1', minval=1, maxval=10000, distribution='loguniform'),
+    ],
+    tensors = [
+        FuzzedTensor('x', size=('k0', 'k1'), min_elements=128, max_elements=10000000, probability_contiguous=0.6)
+    ],
+    seed=0,
+)
+
+results = []
+for tensors, tensor_params, params in example_fuzzer.take(10):
+    # description is the column label
+    sub_label=f"{params['k0']:<6} x {params['k1']:<4} {'' if tensor_params['x']['is_contiguous'] else '(discontiguous)'}"
+    results.append(benchmark.Timer(
+        stmt='batched_dot_mul_sum(x, x)',
+        setup='from __main__ import batched_dot_mul_sum',
+        globals=tensors,
+        label='Batched dot',
+        sub_label=sub_label,
+        description='mul/sum',
+    ).blocked_autorange(min_run_time=1))
+    results.append(benchmark.Timer(
+        stmt='batched_dot_bmm(x, x)',
+        setup='from __main__ import batched_dot_bmm',
+        globals=tensors,
+        label='Batched dot',
+        sub_label=sub_label,
+        description='bmm',
+    ).blocked_autorange(min_run_time=1))
+
+compare = benchmark.Compare(results)
+compare.trim_significant_figures()
+compare.print()
+
+# Instruction counts with Callgrind
+# More deterministic proxy for where time is spent in a process
+# Use C++ code to show the difference of passing by value or reference
+# Note: I did not run this code. Need more packages
+
+batched_dot_src = """\
+/* ---- Python ---- */
+// def batched_dot_mul_sum(a, b):
+//     return a.mul(b).sum(-1)
+
+torch::Tensor batched_dot_mul_sum_v0(
+    const torch::Tensor a,
+    const torch::Tensor b) {
+  return a.mul(b).sum(-1);
+}
+
+torch::Tensor batched_dot_mul_sum_v1(
+    const torch::Tensor& a,
+    const torch::Tensor& b) {
+  return a.mul(b).sum(-1);
+}
+"""
+
+
+# PyTorch makes it easy to test our C++ implementations by providing a utility
+# to JIT compile C++ source into Python extensions:
+import os
+from torch.utils import cpp_extension
+cpp_lib = cpp_extension.load_inline(
+    name='cpp_lib',
+    cpp_sources=batched_dot_src,
+    extra_cflags=['-O3'],
+    extra_include_paths=[
+        # `load_inline` needs to know where to find ``pybind11`` headers.
+        os.path.join(os.getenv('CONDA_PREFIX'), 'include')
+    ],
+    functions=['batched_dot_mul_sum_v0', 'batched_dot_mul_sum_v1']
+)
+
+# `load_inline` will create a shared object that is loaded into Python. When we collect
+# instruction counts Timer will create a subprocess, so we need to re-import it. The
+# import process is slightly more complicated for C extensions, but that's all we're
+# doing here.
+module_import_str = f"""\
+# https://stackoverflow.com/questions/67631/how-to-import-a-module-given-the-full-path
+import importlib.util
+spec = importlib.util.spec_from_file_location("cpp_lib", {repr(cpp_lib.__file__)})
+cpp_lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cpp_lib)"""
+
+import textwrap
+def pretty_print(result):
+    """Import machinery for ``cpp_lib.so`` can get repetitive to look at."""
+    print(repr(result).replace(textwrap.indent(module_import_str, "  "), "  import cpp_lib"))
+
+
+t_baseline = benchmark.Timer(
+    stmt='batched_dot_mul_sum(x, x)',
+    setup='''\
+from __main__ import batched_dot_mul_sum
+x = torch.randn(2, 2)''')
+
+t0 = benchmark.Timer(
+    stmt='cpp_lib.batched_dot_mul_sum_v0(x, x)',
+    setup=f'''\
+{module_import_str}
+x = torch.randn(2, 2)''')
+
+t1 = benchmark.Timer(
+    stmt='cpp_lib.batched_dot_mul_sum_v1(x, x)',
+    setup=f'''\
+{module_import_str}
+x = torch.randn(2, 2)''')
+
+# Moving to C++ did indeed reduce overhead, but it's hard to tell which
+# calling convention is more efficient. v1 (call with references) seems to
+# be a bit faster, but it's within measurement error.
+pretty_print(t_baseline.blocked_autorange())
+pretty_print(t0.blocked_autorange())
+pretty_print(t1.blocked_autorange())
+
+# Let's use ``Callgrind`` to determine which is better.
+stats_v0 = t0.collect_callgrind()
+stats_v1 = t1.collect_callgrind()
+
+pretty_print(stats_v0)
+pretty_print(stats_v1)
+
+# `.as_standardized` removes file names and some path prefixes, and makes
+# it easier to read the function symbols.
+stats_v0 = stats_v0.as_standardized()
+stats_v1 = stats_v1.as_standardized()
+
+# `.delta` diffs the instruction counts, and `.denoise` removes several
+# functions in the Python interpreter that are known to have significant
+# jitter.
+delta = stats_v1.delta(stats_v0).denoise()
+
+# `.transform` is a convenience API for transforming function names. It is
+# useful for increasing cancelation when ``diff-ing`` instructions, as well as
+# just generally improving readability.
+replacements = (
+    ("???:void pybind11", "pybind11"),
+    ("batched_dot_mul_sum_v0", "batched_dot_mul_sum_v1"),
+    ("at::Tensor, at::Tensor", "..."),
+    ("at::Tensor const&, at::Tensor const&", "..."),
+    ("auto torch::detail::wrap_pybind_function_impl_", "wrap_pybind_function_impl_"),
+)
+for before, after in replacements:
+    delta = delta.transform(lambda l: l.replace(before, after))
+
+# We can use print options to control how much of the function to display.
+torch.set_printoptions(linewidth=160)
+
+# Once parsed, the instruction counts make clear that passing `a` and `b`
+# by reference is more efficient as it skips some ``c10::TensorImpl`` bookkeeping
+# for the intermediate Tensors, and is also works better with ``pybind11``. This
+# is consistent with our noisy wall time observations.
+print(delta)
 
 """## Parameterizations
 
+- Regularization techniques that use a function to add extra structure to parameters to enhance learning and reduce overfitting
+- Examples include making matricies orthogonal or dividing by a norm
+
+
 - PyTorch tutorial: https://pytorch.org/tutorials/intermediate/parametrizations.html
+
+### Parameterization by hand - Symmetric weights
 """
 
+import torch
+import torch.nn as nn
+import torch.nn.utils.parametrize as parametrize
 
+def symmetric(X):
+    return X.triu() + X.triu(1).transpose(-1, -2)
+
+X = torch.rand(3, 3)
+A = symmetric(X)
+assert torch.allclose(A, A.T)  # A is symmetric
+print(A)                       # Quick visual check
+
+class LinearSymmetric(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.rand(n_features, n_features))
+
+    def forward(self, x):
+        A = symmetric(self.weight)
+        return x @ A
+
+
+layer = LinearSymmetric(3)
+out = layer(torch.rand(8, 3))
+
+"""Issues:
+- The layer needs to implemented explicitly
+- Parameterization is specific to the layer
+- Recomputes A each pass
+
+### PyTorch Parameterizations
+"""
+
+class Symmetric(nn.Module):
+    def forward(self, X):
+        return X.triu() + X.triu(1).transpose(-1, -2)
+
+layer = nn.Linear(3, 3)
+parametrize.register_parametrization(layer, "weight", Symmetric())
+
+A = layer.weight
+assert torch.allclose(A, A.T)  # A is symmetric
+print(A)                       # Quick visual check
+
+class Skew(nn.Module):
+    def forward(self, X):
+        A = X.triu(1)
+        return A - A.transpose(-1, -2)
+
+
+cnn = nn.Conv2d(in_channels=5, out_channels=8, kernel_size=3)
+parametrize.register_parametrization(cnn, "weight", Skew())
+# Print a few kernels
+print(cnn.weight[0, 1])
+print(cnn.weight[2, 2])
+
+# Caching parametrization
+class NoisyParametrization(nn.Module):
+    def forward(self, X):
+        print("Computing the Parametrization")
+        return X
+
+layer = nn.Linear(4, 4)
+parametrize.register_parametrization(layer, "weight", NoisyParametrization())
+print("Here, layer.weight is recomputed every time we call it")
+foo = layer.weight + layer.weight.T
+bar = layer.weight.sum()
+with parametrize.cached():
+    print("Here, it is computed just the first time layer.weight is called")
+    foo = layer.weight + layer.weight.T
+    bar = layer.weight.sum()
+
+# Concatenating Parametrizations
+class CayleyMap(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.register_buffer("Id", torch.eye(n))
+
+    def forward(self, X):
+        # (I + X)(I - X)^{-1}
+        return torch.linalg.solve(self.Id - X, self.Id + X)
+
+layer = nn.Linear(3, 3)
+parametrize.register_parametrization(layer, "weight", Skew())
+parametrize.register_parametrization(layer, "weight", CayleyMap(3))
+X = layer.weight
+print(torch.dist(X.T @ X, torch.eye(3)))  # X is orthogonal
+
+# Initialize Parametrizations - right_inverse
+class Skew(nn.Module):
+    def forward(self, X):
+        A = X.triu(1)
+        return A - A.transpose(-1, -2)
+
+    def right_inverse(self, A):
+        # We assume that A is skew-symmetric
+        # We take the upper-triangular elements, as these are those used in the forward
+        return A.triu(1)
+
+layer = nn.Linear(3, 3)
+parametrize.register_parametrization(layer, "weight", Skew())
+X = torch.rand(3, 3)
+X = X - X.T                             # X is now skew-symmetric
+layer.weight = X                        # Initialize layer.weight to be X
+print(torch.dist(layer.weight, X))      # layer.weight == X
+
+# Removing Parametrizations
+layer = nn.Linear(3, 3)
+print("Before:")
+print(layer)
+print(layer.weight)
+parametrize.register_parametrization(layer, "weight", Skew())
+print("\nParametrized:")
+print(layer)
+print(layer.weight)
+parametrize.remove_parametrizations(layer, "weight")
+print("\nAfter. Weight has skew-symmetric values but it is unconstrained:")
+print(layer)
+print(layer.weight)
+
+# Rollback to original version (non-parametrized)
+layer = nn.Linear(3, 3)
+print("Before:")
+print(layer)
+print(layer.weight)
+parametrize.register_parametrization(layer, "weight", Skew())
+print("\nParametrized:")
+print(layer)
+print(layer.weight)
+parametrize.remove_parametrizations(layer, "weight", leave_parametrized=False)
+print("\nAfter. Same as Before:")
+print(layer)
+print(layer.weight)
 
 """## Pruning
 
+- Efficiently compress models by reducing the number of parameters
+- Assumes base neural networks are over-parametrized
+
+
 - PyTorch tutorial: https://pytorch.org/tutorials/intermediate/pruning_tutorial.html
 """
+
+import torch
+from torch import nn
+import torch.nn.utils.prune as prune
+import torch.nn.functional as F
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class LeNet(nn.Module):
+    def __init__(self):
+        super(LeNet, self).__init__()
+        # 1 input image channel, 6 output channels, 5x5 square conv kernel
+        self.conv1 = nn.Conv2d(1, 6, 5)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)  # 5x5 image dimension
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x):
+        x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
+        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
+        x = x.view(-1, int(x.nelement() / x.shape[0]))
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+model = LeNet().to(device=device)
+
+# Inspect the unpruned module
+module = model.conv1
+print(list(module.named_parameters()))
+print(list(module.named_buffers()))
+
+# Random pruning
+prune.random_unstructured(module, name='weight', amount=0.3)
+
+# Can also prune bias
+# prune.l1_unstructured(module, name="bias", amount=3)
+
+print(list(module.named_parameters()))
+print(list(module.named_buffers()))
+print(module.weight)
+print(module._forward_pre_hooks)
+
+# Stacked Pruning - Prune the #of channels
+prune.ln_structured(module, name="weight", amount=0.5, n=2, dim=0)
+
+# As we can verify, this will zero out all the connections corresponding to
+# 50% (3 out of 6) of the channels, while preserving the action of the
+# previous mask.
+print(module.weight)
+
+# Serializing pruned model
+print(model.state_dict().keys())
+
+# Make pruned state permanent
+prune.remove(module, 'weight')
+print(list(module.named_parameters()))
+
+# Pruning multiple parameters
+new_model = LeNet()
+for name, module in new_model.named_modules():
+    # prune 20% of connections in all 2D-conv layers
+    if isinstance(module, torch.nn.Conv2d):
+        prune.l1_unstructured(module, name='weight', amount=0.2)
+    # prune 40% of connections in all linear layers
+    elif isinstance(module, torch.nn.Linear):
+        prune.l1_unstructured(module, name='weight', amount=0.4)
+
+print(dict(new_model.named_buffers()).keys())  # to verify that all masks exist
+
+# Global pruning
+model = LeNet()
+
+parameters_to_prune = (
+    (model.conv1, 'weight'),
+    (model.conv2, 'weight'),
+    (model.fc1, 'weight'),
+    (model.fc2, 'weight'),
+    (model.fc3, 'weight'),
+)
+
+prune.global_unstructured(
+    parameters_to_prune,
+    pruning_method=prune.L1Unstructured,
+    amount=0.2,
+)
+
+print(
+    "Sparsity in conv1.weight: {:.2f}%".format(
+        100. * float(torch.sum(model.conv1.weight == 0))
+        / float(model.conv1.weight.nelement())
+    )
+)
+print(
+    "Sparsity in conv2.weight: {:.2f}%".format(
+        100. * float(torch.sum(model.conv2.weight == 0))
+        / float(model.conv2.weight.nelement())
+    )
+)
+print(
+    "Sparsity in fc1.weight: {:.2f}%".format(
+        100. * float(torch.sum(model.fc1.weight == 0))
+        / float(model.fc1.weight.nelement())
+    )
+)
+print(
+    "Sparsity in fc2.weight: {:.2f}%".format(
+        100. * float(torch.sum(model.fc2.weight == 0))
+        / float(model.fc2.weight.nelement())
+    )
+)
+print(
+    "Sparsity in fc3.weight: {:.2f}%".format(
+        100. * float(torch.sum(model.fc3.weight == 0))
+        / float(model.fc3.weight.nelement())
+    )
+)
+print(
+    "Global sparsity: {:.2f}%".format(
+        100. * float(
+            torch.sum(model.conv1.weight == 0)
+            + torch.sum(model.conv2.weight == 0)
+            + torch.sum(model.fc1.weight == 0)
+            + torch.sum(model.fc2.weight == 0)
+            + torch.sum(model.fc3.weight == 0)
+        )
+        / float(
+            model.conv1.weight.nelement()
+            + model.conv2.weight.nelement()
+            + model.fc1.weight.nelement()
+            + model.fc2.weight.nelement()
+            + model.fc3.weight.nelement()
+        )
+    )
+)
+
+# Custom pruning
+class FooBarPruningMethod(prune.BasePruningMethod):
+    """Prune every other entry in a tensor
+    """
+    PRUNING_TYPE = 'unstructured'
+
+    def compute_mask(self, t, default_mask):
+        mask = default_mask.clone()
+        mask.view(-1)[::2] = 0
+        return mask
+
+def foobar_unstructured(module, name):
+    """Prunes tensor corresponding to parameter called `name` in `module`
+    by removing every other entry in the tensors.
+    Modifies module in place (and also return the modified module)
+    by:
+    1) adding a named buffer called `name+'_mask'` corresponding to the
+    binary mask applied to the parameter `name` by the pruning method.
+    The parameter `name` is replaced by its pruned version, while the
+    original (unpruned) parameter is stored in a new parameter named
+    `name+'_orig'`.
+
+    Args:
+        module (nn.Module): module containing the tensor to prune
+        name (string): parameter name within `module` on which pruning
+                will act.
+
+    Returns:
+        module (nn.Module): modified (i.e. pruned) version of the input
+            module
+
+    Examples:
+        >>> m = nn.Linear(3, 4)
+        >>> foobar_unstructured(m, name='bias')
+    """
+    FooBarPruningMethod.apply(module, name)
+    return module
+
+model = LeNet()
+foobar_unstructured(model.fc3, name='bias')
+
+print(model.fc3.bias_mask)
+
